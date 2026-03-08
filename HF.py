@@ -335,7 +335,7 @@ if __name__ == "__main__":
     h2o_molecule = Molecule([atom1, atom2, atom3], charge=0, multiplicity=1)
 
     # Run a Hartree–Fock calculation using the 3-21G basis set
-    hf_calculator = HartreeFock(h2o_molecule, basis_name='3-21g')
+    hf_calculator = HartreeFock(h2o_molecule, basis_name='STO-3G')
     result = hf_calculator.scf_iteration(max_iter=50, tol=1e-6)
 
     # Print final molecular orbital energies

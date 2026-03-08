@@ -57,8 +57,7 @@ class SpinDensityVisualizer:
         for idx, func in enumerate(self.basis_functions):
             phi_cart[:, idx] = np.array([func.value(r) for r in points])
 
-        cart2sph = CartToSph(self.basis_functions)
-        X = cart2sph.build_transform_matrix()
+        X = CartToSph(self.basis_functions).build_transform_matrix()
         phi_sph = phi_cart @ X.T
         # 计算自旋密度：ρ_spin = ∑_{μν} P_spin[μν] φ_μ φ_ν = diag(phi_sph @ P_spin @ phi_sph.T)
         # 用公式：ρ_spin = sum( (phi_sph @ P_spin) * phi_sph, axis=1 )
