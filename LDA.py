@@ -6,6 +6,7 @@ from BasisSet import BasisSetManager
 from Gaussian import BasisFunction
 from Integrals import OneElectronIntegrals, TwoElectronIntegrals
 from Cart2Sph import CartToSph
+from Grid import MoleculeGrid
 
 np.set_printoptions(
     threshold=200,
@@ -15,7 +16,7 @@ np.set_printoptions(
 
 
 # ==================== Hartree-Fock Calculator ====================
-class HartreeFock:
+class LDA:
     """
     Main class for performing closed‑shell Hartree–Fock calculations.
     Handles basis set construction, integral evaluation, SCF iterations,
@@ -44,8 +45,7 @@ class HartreeFock:
         self.nocc = molecule.nelectrons // 2  # Number of occupied orbitals (closed‑shell)
 
         # Build transformation matrix from Cartesian to spherical harmonic Gaussians
-        cart2sph = CartToSph(self.basis_functions)
-        self.X = cart2sph.build_transform_matrix()  # Transformation matrix, shape (n_sph, nbasis)
+        self.X = CartToSph(self.basis_functions).build_transform_matrix()  # Transformation matrix, shape (n_sph, nbasis)
         self.n_sph = self.X.shape[0]  # Number of spherical harmonic basis functions
 
         # Initialise matrices (all will be in the spherical harmonic basis)
@@ -53,14 +53,13 @@ class HartreeFock:
         self.T = np.zeros((self.n_sph, self.n_sph))  # Kinetic energy matrix
         self.V = np.zeros((self.n_sph, self.n_sph))  # Nuclear attraction matrix
         self.H = np.zeros((self.n_sph, self.n_sph))  # Core Hamiltonian (T + V)
-        self.F = np.zeros((self.n_sph, self.n_sph))  # Fock matrix
+        self.J = np.zeros((self.n_sph, self.n_sph))  # Coulomb matrix
         self.P = np.zeros((self.n_sph, self.n_sph))  # Density matrix
         self.C = np.zeros((self.n_sph, self.n_sph))  # Molecular orbital coefficients
+        self.KS = np.zeros((self.n_sph, self.n_sph))  # KS matrix
+        self.V_xc = np.zeros((self.n_sph, self.n_sph))  # Exchange-Correlation matrix
 
         self.epsilon = np.zeros(self.n_sph)  # Orbital energies
-        self.electron_energy = 0.
-        self.nuclei_repulsion_energy = self.molecule.nuclear_repulsion_energy
-        self.hartree_fock_energy = 0.
 
         # Electron repulsion integrals (ERI) in Cartesian basis (4‑index array)
         self.ERI = np.zeros([self.nbasis, self.nbasis, self.nbasis, self.nbasis])
@@ -71,6 +70,13 @@ class HartreeFock:
         self._compute_one_electron_integrals()
         # Compute two‑electron integrals and transform
         self._compute_two_electron_integrals()
+
+        # molecule grid for DFT calculations
+        self.mol_grid = MoleculeGrid(molecule, n_radial=75, preset="fine").build_molecule_grid()
+        self.phi_sph = self._compute_spherical_basis_value()
+        self.dphi_sph = self._compute_spherical_basis_derivative()
+        self.laplace_phi_sph = self._compute_spherical_basis_laplace()
+        self.v_xc_grid = np.zeros(len(self.mol_grid.points))
 
     def _construct_basis_functions(self) -> List[BasisFunction]:
         """
@@ -181,25 +187,67 @@ class HartreeFock:
         # An alternative, more compact transformation using einsum would be:
         # self.ERI = np.einsum('pqrs,pi,qj,rk,sl->ijkl', self.ERI, X, X, X, X)
 
-    def compute_fock_matrix(self):
+    def _compute_spherical_basis_value(self):
+        points = self.mol_grid.points
+
+        phi_cart = np.zeros([points.shape[0], len(self.basis_functions)])
+        for idx, func in enumerate(self.basis_functions):
+            phi_cart[:, idx] = np.array([func.value(r) for r in points])
+
+        phi_sph = phi_cart @ self.X.T
+
+        return phi_sph
+
+    def _compute_spherical_basis_derivative(self):
+        points = self.mol_grid.points
+        dphi_cart = np.zeros([points.shape[0], len(self.basis_functions)])
+        for idx, func in enumerate(self.basis_functions):
+            dphi_cart[:, idx] = np.array([func.squared_derivative(r, 1) for r in points])
+
+        dphi_sph = dphi_cart @ self.X.T
+        return dphi_sph
+
+    def _compute_spherical_basis_laplace(self):
+        points = self.mol_grid.points
+        laplace_phi_cart = np.zeros([points.shape[0], len(self.basis_functions)])
+        for idx, func in enumerate(self.basis_functions):
+            laplace_phi_cart[:, idx] = np.array([func.laplace(r) for r in points])
+
+        laplace_phi_sph = laplace_phi_cart @ self.X.T
+        return laplace_phi_sph
+
+    def _compute_electron_density(self):
+
+        return np.sum((self.phi_sph @ self.P) * self.phi_sph, axis=1)
+
+    def _compute_lda_xc(self):
+
+        from Functionals import LDA
+
+        rho = self._compute_electron_density()
+
+        v_x, E_x = LDA(self.mol_grid.weights).compute_ex_vx(rho)
+        v_c, E_c = LDA(self.mol_grid.weights).compute_ec_vc(rho)
+
+        # 总交换相关势
+        v_xc = v_x + v_c
+        E_xc = E_x + E_c
+
+        return v_xc, E_xc
+
+    def _compute_kohn_sham_matrix(self):
         """
         Build the Fock matrix in the spherical harmonic basis from the current density matrix.
-        F = H + J - K, where J and K are the Coulomb and exchange matrices respectively.
+        F = H + J + V, where J and K are the Coulomb and exchange matrices respectively.
         """
-        J = np.zeros([self.n_sph, self.n_sph])
-        K = np.zeros([self.n_sph, self.n_sph])
+        self.J = np.zeros([self.n_sph, self.n_sph])
 
         # Sum over all four indices of the two‑electron integrals
-        for i in range(self.n_sph):
-            for j in range(self.n_sph):
-                for k in range(self.n_sph):
-                    for l in range(self.n_sph):
-                        # Coulomb contribution: J_ij = ∑_kl P_kl (ij|kl)
-                        J[i, j] += self.P[k, l] * self.SphERI[i, j, k, l]
-                        # Exchange contribution: K_ij = ½ ∑_kl P_kl (ik|jl)
-                        K[i, j] += 0.5 * self.P[k, l] * self.SphERI[i, k, j, l]
+        self.J = np.einsum('kl,ijkl->ij', self.P, self.SphERI)
 
-        self.F = self.H + J - K
+        self.V_xc = self.phi_sph.T @ (np.tile((self.v_xc_grid * self.mol_grid.weights).reshape(-1, 1), (1, self.n_sph)) * self.phi_sph)
+
+        self.KS = self.H + self.J + self.V_xc
 
     def scf_iteration(self, max_iter: int = 100, tol: float = 1e-8) -> Dict:
         """
@@ -233,14 +281,15 @@ class HartreeFock:
         # Build the initial density matrix from the occupied MOs
         self._build_density_matrix()
 
-        energy_old = 0.0
+        # compute initial energy, e_xc and v_xc
+        energy_old = self._compute_total_energy()
         for iteration in range(max_iter):
 
             # 1.Compute Fock matrix from current density
-            self.compute_fock_matrix()
+            self._compute_kohn_sham_matrix()
 
             # 2.Solve the Roothaan–Hall equations: F C = S C ε
-            eigenvalues, eigenvectors = self._solve_roothaan_equation(self.F, self.S)
+            eigenvalues, eigenvectors = self._solve_roothaan_equation(self.KS, self.S)
             self.C = eigenvectors
             self.epsilon = eigenvalues
 
@@ -249,6 +298,9 @@ class HartreeFock:
 
             # 4.Compute total electronic + nuclear energy
             energy = self._compute_total_energy()
+            rho = self._compute_electron_density()
+            N_integrated = np.sum(self.mol_grid.weights * rho)
+            print(f"Integrated electrons: {N_integrated:.6f} (expected {self.molecule.nelectrons})")
 
             # 5.Check convergence
             delta_energy = abs(energy - energy_old)
@@ -256,12 +308,10 @@ class HartreeFock:
                   f"ΔE = {delta_energy:10.3e}")
 
             if delta_energy < tol:
-                self.hartree_fock_energy = energy
-                self.electron_energy = energy - self.nuclei_repulsion_energy
                 print(f"\nSCF converged in {iteration + 1} iterations")
                 print(f"Final total energy: {energy:.10f} Hartree")
-                print(f"Electronic energy: {self.electron_energy:.10f} Hartree")
-                print(f"Nuclear repulsion energy: {self.nuclei_repulsion_energy:.10f} Hartree")
+                print(f"Electronic energy: {energy - self.molecule.nuclear_repulsion_energy:.10f} Hartree")
+                print(f"Nuclear repulsion energy: {self.molecule.nuclear_repulsion_energy:.10f} Hartree")
                 return {
                     "energy": energy,
                     "converged": True,
@@ -318,16 +368,21 @@ class HartreeFock:
         where C_occ contains the occupied orbitals.
         """
         C_occ = self.C[:, :self.nocc]
-        self.P = 2.0 * C_occ @ C_occ.T
+        self.P = 0.6 * C_occ @ C_occ.T + 0.7 * self.P
 
     def _compute_total_energy(self) -> float:
         """
         Compute the total Hartree–Fock energy:
         E_total = ½ Tr[P (H + F)] + E_nuc
         """
-        electronic_energy = 0.5 * np.sum(self.P * (self.H + self.F))
-        total_energy = electronic_energy + self.nuclei_repulsion_energy
-        return float(total_energy)
+        # 单电子部分：Tr[P * H_core]
+        E_one = np.einsum('ij,ji->', self.P, self.H)  # 或 np.sum(P * H_core)
+        self.J = np.einsum('kl,ijkl->ij', self.P, self.SphERI)
+        E_j = 0.5 * np.einsum('ij,ji->', self.P, self.J)  # 或 0.5 * np.sum(P * J)
+        self.v_xc_grid, self.E_xc = self._compute_lda_xc()
+        # 总电子能量
+        E_elec = E_one + E_j + self.E_xc + self.molecule.nuclear_repulsion_energy
+        return E_elec
 
 
 # ==================== Test code ====================
@@ -340,8 +395,9 @@ if __name__ == "__main__":
     h2o_molecule = Molecule([atom1, atom2, atom3], charge=0, multiplicity=1)
 
     # Run a Hartree–Fock calculation using the 3-21G basis set
-    hf_calculator = HartreeFock(h2o_molecule, basis_name='STO-3G')
-    result = hf_calculator.scf_iteration(max_iter=50, tol=1e-6)
+    hf_calculator = LDA(h2o_molecule, basis_name='6-31G')
+    result = hf_calculator.scf_iteration(max_iter=500, tol=1e-6)
+
 
     # Print final molecular orbital energies
     print("\nMolecular orbital energies (Hartree):")

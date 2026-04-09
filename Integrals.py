@@ -7,16 +7,30 @@ from OSrecursion import ObaraSaikaRecursion
 
 # ==================== One-Electron Integrals ====================
 class OneElectronIntegrals:
-    """单电子积分计算"""
+    """One-electron integral calculator for molecular quantum mechanics."""
     @staticmethod
     def overlap_integral(basis_a: BasisFunction, basis_b: BasisFunction) -> float:
-        """计算重叠积分 S_ab = ⟨a|b⟩"""
+        """
+        Compute the overlap integral S_ab = ⟨a|b⟩.
+
+        Parameters:
+        -----------
+        basis_a : BasisFunction
+            Left basis function.
+        basis_b : BasisFunction
+            Right basis function.
+
+        Returns:
+        --------
+        float
+            Overlap integral value.
+        """
         S = 0.0
         for i in range(basis_a.n_prim):
             for j in range(basis_b.n_prim):
                 prim_a = basis_a.primitives[i]
                 prim_b = basis_b.primitives[j]
-                # 重叠积分值
+                # Overlap integral between primitive Gaussians
                 integral_value = prim_a.norm_factor * prim_b.norm_factor * GaussianIntegral.gaussian_overlap_int(prim_a, prim_b)
                 S += (basis_a.coefficients[i] * basis_b.coefficients[j] * integral_value)
 
